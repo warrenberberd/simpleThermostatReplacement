@@ -1,6 +1,6 @@
 center {
-    width: 420px;
-    max-width: 100%;
+    min-width: 420px;
+    max-width: 90%;
     margin: 0px auto;
     font-family: 'Roboto', sans-serif;
     color: #444;

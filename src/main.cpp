@@ -1,49 +1,56 @@
-//
-// FILE: UserDataDemo.ino
-// AUTHOR: Rob Tillaart
-// VERSION: 0.1.0
-// PURPOSE: use of alarm field as user identification demo
-// DATE: 2019-12-23
-// URL:
-//
-// Released to the public domain
-//
 #include <Arduino.h>
 
+#define ENABLE_WEBSOCKET  true
+
 #include "simpleThermostat.h"
+
+//#define AR53002_LED_PIN     NOT_A_PIN
+//#define AR53002_SW_PIN     NOT_A_PIN
+#define AR53002_LED_PIN     D5   // Correspond to GPIO14
+#define AR53002_SW_PIN      D6   // Correspond to GPIO12
+
+#define ONE_WIRE_BUS        D3    // Correspond to GPIO3
+#define BAT                 A0
+#define LED                 LED_BUILTIN
+#define LED2                NOT_A_PIN
+
+#define RESET_SWITCH        D0
+
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
 
 // Need to be Created for injection of Wifi Credential
 #include "WiFiCred.h"
 
 //ESP8266WiFiMulti wifiMulti;       // Create an instance of the ESP8266WiFiMulti class, called 'wifiMulti'
-AsyncWebServer server(80);       // Create a webserver object that listens for HTTP request on port 80
-//WebSocketsServer webSocket(81);    // create a websocket server on port 81
+AsyncWebServer server(80);          // Create a webserver object that listens for HTTP request on port 80
+AsyncWebSocket webSocket("/ws");           // create a websocket server on port 81
 
 File fsUploadFile;                 // a File variable to temporarily store the received file
-
-#define ENABLE_DEEP_SLEEP true
-//#define DEEP_SLEEP_INTERVAL 30000000  // Interval of deepsleep in microSecond
-
-#define ESP_NAME "RADIATEUR_CUISINE"
 
 const char* mdnsName = ESP_NAME; // Domain name for the mDNS responder
 
 //const char *ssid = ESP_NAME; // The name of the Wi-Fi network that will be created
-//const char *password = OTA_PASS;   // The password required to connect to it, leave blank for an open network
+//const char *password = WIFI_PASS;   // The password required to connect to it, leave blank for an open network
 
 
 const char *OTAName = ESP_NAME;           // A name and a password for the OTA service
-const char *OTAPassword = OTA_PASS;
+const char *OTAPassword = WIFI_PASS;
 
-#define LED_PIN   LED_BUILTIN
+uint8_t deviceCount = 0;
 
-#define ONE_WIRE_BUS      D3
-#define BAT A0
+unsigned long lastTemperatureSent = 0;  // When we last set the temperature
+unsigned long lastSwitchChange = 0;  // When we last change switch State
 
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+float currentTemp=-127.00;
+float currentThermostat=25.00;    // The default wanted temperature
+float currentVoltage=99.99;
+String relayStatus="UNKNOWN";
+String oldRelayStatus="UNKNOWN";
+String currentWifi="UNKNOWN";
 
-#define DEFAULT_TEMPERATURE_INTERVAL 30000
+//bool switchState=false;
 
 HomieSetting<long> deepSleeIntervalSetting("deepSleepInterval", "Deep Sleep interval in Seconds");  // id, description
 
@@ -51,19 +58,13 @@ HomieNode temperatureNode("temperature", "Temperature", "temperature");
 HomieSetting<long> temperatureIntervalSetting("temperatureInterval", "The temperature interval in seconds");
 
 HomieNode voltageNode("voltage", "Voltage", "voltage");
+HomieNode switchNode("thermostat", "Thermostat", "thermostat");
 
-unsigned long lastTemperatureSent = 0;  // When we last set the temperature
+Timer tTimer;    // For DeepSleep
 
-uint8_t deviceCount = 0;
-
-float currentTemp=99.99;
-float currentVoltage=99.99;
-
-Timer t;    // For DeepSleep
-
-void prepareSleep() {
-  Homie.prepareToSleep();
-}
+// Flag qui indique si on doit envoyer un pulse sur le Switch
+// Ce mode de fonctionnement est nécessaire pour permettre au callback WebSocket d'etre court
+bool HAVE_TO_PULSE=false; 
 
 // Add 4 prepared sensors to the bus
 // use the UserDataWriteBatch demo to prepare 4 different labeled sensors
@@ -72,14 +73,21 @@ struct{
   DeviceAddress addr;
 } T[4];
 
+ICACHE_RAM_ATTR void callbackResetSwitch(){
+  ESP.reset();
+}
+
 float getTempByID(int id){
   for (uint8_t index = 0; index < deviceCount; index++)
   {
-    if (T[index].id == id)
-    {
+    if (T[index].id == id){
       return sensors.getTempC(T[index].addr);
     }
   }
+
+  #ifdef DEBUG
+    Serial.println("Unable to find SPI Devices");
+  #endif
   return -999;
 }
 
@@ -90,6 +98,286 @@ void printAddress(DeviceAddress deviceAddress){
     if (deviceAddress[i] < 16) Serial.print("0");
     Serial.print(deviceAddress[i], HEX);
   }
+}
+
+bool setupTemp(){
+  sensors.setResolution(12);  // Set precision to maximum
+  sensors.setWaitForConversion(false);  // Dont block requestTemperatures function waiting to convertion
+
+  sensors.begin();
+
+  delay(200);
+
+  // count devices
+  deviceCount = sensors.getDeviceCount();
+#ifdef DEBUG
+  Serial.print("SPI #devices: ");
+  Serial.println(deviceCount);
+#endif
+
+  // Read ID's per sensor
+  // and put them in T array
+  for (uint8_t index = 0; index < deviceCount; index++){
+    // go through sensors
+    sensors.getAddress(T[index].addr, index);
+    T[index].id = sensors.getUserData(T[index].addr);
+
+    #ifdef DEBUG
+      Serial.write("SPI devices id: ");
+      Serial.print(T[index].id);
+      //Serial.write("  At adress: ");
+      //Serial.write((char)T[index].addr);
+      Serial.println("");
+    #endif
+  }
+
+  return true;
+}
+
+bool setupAR53002(){
+  if(AR53002_LED_PIN!=NOT_A_PIN) pinMode(AR53002_LED_PIN,INPUT_PULLDOWN_16);
+  //if(AR53002_SW_PIN!=NOT_A_PIN) pinMode(AR53002_SW_PIN,OUTPUT);
+  if(AR53002_SW_PIN!=NOT_A_PIN) pinMode(AR53002_SW_PIN,INPUT);
+  if(LED!=NOT_A_PIN) pinMode(LED,OUTPUT);
+  if(LED2!=NOT_A_PIN) pinMode(LED2,OUTPUT);
+
+  if(RESET_SWITCH!=NOT_A_PIN) attachInterrupt(digitalPinToInterrupt(RESET_SWITCH), callbackResetSwitch, CHANGE);
+
+  return true;
+}
+
+// Reading VOLT Value from ADC (A0)
+float readVoltValue(){
+  //int value = LOW;
+  //float Tvoltage=0.0;
+  float Vvalue=0.0,Rvalue=0.0;
+
+  uint maxCycleAverage=10;
+
+  // Read 10 value of voltage
+  for(unsigned int i=0;i<maxCycleAverage;i++){
+    Vvalue=Vvalue+analogRead(BAT);         //Read analog Voltage
+    delay(5);                              //ADC stable
+  }
+
+  Vvalue=(float)Vvalue*1.0/maxCycleAverage;   //Find average of 10 values
+
+  #ifdef DEBUG
+    //Serial.printf("Raw ADC Value: %f\n",Vvalue);
+  #endif
+
+  Rvalue=(float)(Vvalue/1024.0)*3.3;            //Convert Voltage in 3.3v factor
+
+  currentVoltage=Rvalue;
+
+  return Rvalue;
+}
+
+// Reading temperature from DS2013
+float readTempValue(){
+  // If not initialized, run setupTemp
+  if(T[0].addr==0 || deviceCount==0) setupTemp();
+
+  //Serial.println("    [DEBUG] requestTemperatures()...");
+  if(sensors.isConversionComplete()){
+    sensors.requestTemperatures();  // Take 480ms
+
+    //Serial.println("    [DEBUG] getTempC()...");
+    currentTemp=sensors.getTempC(T[0].addr);  // Get temp of first sensor
+    //Serial.println("    [DEBUG] readTempValue() OK.");
+  }
+
+  return currentTemp;
+}
+
+void sendWSAllValues(){
+  // Send Switch Change to WebSocket client
+  String outStr="{";
+  outStr+="\"temp\": "          + String(currentTemp) + ",";
+  outStr+=" \"voltage\": "      + String(currentVoltage) + ",";
+  outStr+=" \"switch\": \""     + relayStatus + "\",";
+  outStr+=" \"thermostat\": \"" + String(currentThermostat) + "\",";
+  outStr+=" \"uptime\": "       + String(millis()) + "";
+  outStr+="}";
+
+  // Send Infos to All WebSocket clients
+  webSocket.textAll(outStr.c_str());
+  //webSocket.textAll("{\"temp\": " + String(currentTemp) + ", \"uptime\": "       + String(millis()) + "}");
+}
+
+// Lecture de la LED d'indication d'état du relai
+String readRelayStatus(){
+  int state = digitalRead(AR53002_LED_PIN);
+  int led_state=state;
+
+  oldRelayStatus=relayStatus;
+
+  // If relay go from ON to OFF, recheck due to Led short Blinking
+  if(oldRelayStatus=="ON" && state==HIGH){
+    delay(100);
+    state = digitalRead(AR53002_LED_PIN);
+    led_state=state;
+  }
+
+  if(state==HIGH){
+    relayStatus=String("OFF");
+    //switchState=true;
+    led_state=HIGH;
+  }else{
+    relayStatus=String("ON");
+    //switchState=false;
+    led_state=LOW;
+  }
+
+  if(LED!=NOT_A_PIN) digitalWrite(LED,led_state);    // On recopie l'état sur la LED BUILT_IN
+  if(LED2!=NOT_A_PIN) digitalWrite(LED2,led_state);    // On recopie l'état sur la LED2 
+
+  return relayStatus;
+}
+
+// Read Thermostat from config file
+float readThermostatValue(){
+  String path=THERMOSTAT_FILE;
+  if(!SPIFFS.exists(path)){
+    #ifdef DEBUG
+      Homie.getLogger() << "Thermostat File does not exists. Returning default" << endl;
+    #endif
+    currentThermostat=25.0;   // Default value
+    return currentThermostat; 
+  }
+
+  File file = SPIFFS.open(path, "r");
+  String content=file.readString();
+  file.close();
+
+  currentThermostat=content.toFloat();
+  return currentThermostat;
+}
+
+String readWifiSSID(){
+  //currentWifi=Homie.getConfiguration().currentWifi.ssid;
+  currentWifi=WIFI_SSID;
+
+  return currentWifi;
+}
+
+// Save Thermostat in config file
+bool writeThermostatValue(float ther){
+  String path=THERMOSTAT_FILE;
+
+  File file = SPIFFS.open(path, "w");
+  file.write(String(ther).c_str());
+  file.close();
+
+  currentThermostat=ther;
+
+  return true;
+}
+
+
+void prepareSleep() {
+  Homie.prepareToSleep();
+}
+
+bool sendPulseToSwitch(){
+  if(!HAVE_TO_PULSE) return false;
+  HAVE_TO_PULSE=false;
+
+  #ifdef DEBUG
+    Serial.println("   [DEBUG] sendPulseToSwitch()");
+  #endif
+
+  if(AR53002_SW_PIN!=NOT_A_PIN){
+    //Serial.println(" [DEBUG] Change pinMode to OUTPUT...");
+    pinMode(AR53002_SW_PIN,OUTPUT);
+
+    //Serial.println(" [DEBUG] DigitalWrite LOW...");
+    digitalWrite(AR53002_SW_PIN,LOW); // Low pulse
+    //Serial.println(" [DEBUG] DigitalWrite LOW OK.");
+    delay(300); // 500ms pulse
+    optimistic_yield(1000);
+    //Serial.println(" [DEBUG] DigitalWrite HIGH...");
+    digitalWrite(AR53002_SW_PIN,HIGH);
+
+    delay(50);
+    //Serial.println(" [DEBUG] DigitalWrite INPUT...");
+    pinMode(AR53002_SW_PIN,INPUT);
+    optimistic_yield(1000);
+
+    return true;
+  }
+
+  webSocket.textAll("{\"switch\": \"" + relayStatus + "\"}");
+
+  return false;
+}
+
+bool toggleSwitch(String newState){
+  #ifdef DEBUG
+    Homie.getLogger() << "Toggle Relay: " << newState << " (newState))" << endl;
+  #endif
+  uint state;
+  if(newState=="ON" && relayStatus=="OFF"){
+    //sendPulseToSwitch();  // Send pulse to change Switch state
+    HAVE_TO_PULSE=true;
+
+    oldRelayStatus=relayStatus;
+    relayStatus="ON";
+    state=LOW;
+    
+    //return true;
+  }else if(newState=="OFF" && relayStatus=="ON"){
+    //sendPulseToSwitch();  // Send pulse to change Switch state
+    HAVE_TO_PULSE=true;
+
+    oldRelayStatus=relayStatus;
+    relayStatus="OFF";
+    
+    state=HIGH;
+
+    //return true;
+  }
+
+  lastSwitchChange=millis();
+
+  if(LED!=NOT_A_PIN) digitalWrite(LED,state);    // On recopie l'état sur la LED BUILT_IN
+  if(LED2!=NOT_A_PIN) digitalWrite(LED2,state);    // On recopie l'état sur la LED2
+
+  return true;
+}
+
+bool changeThermostat(String value){
+  #ifdef DEBUG
+    Homie.getLogger() << "Modify Thermostat: " << value << " °C" << endl;
+  #endif
+  float newTherm=value.toFloat();
+  if(newTherm<16.0 || newTherm>35.0){
+    #ifdef DEBUG
+      Homie.getLogger() << "ERROR : Thermostat value out of range" << endl;
+    #endif
+    return false;
+  }
+
+  return writeThermostatValue(newTherm);
+}
+
+// Determine if we need to enable or disable thermostat
+bool processThermostat(){
+  if (millis() - lastSwitchChange < DEFAULT_SWITCH_INTERVAL && lastSwitchChange > 0){
+    #ifdef DEBUG
+      //Homie.getLogger() << "millis: " << millis()  << "   lastSwitchChange:" << lastSwitchChange << endl;
+      //Homie.getLogger() << "Disabling too frequent Switch Change" << endl;
+    #endif
+    return false;
+  }
+
+  bool state=false;
+  if(currentTemp>=currentThermostat && relayStatus=="ON") state=toggleSwitch("OFF");
+  if(currentTemp<currentThermostat && relayStatus!="ON")  state=toggleSwitch("ON");
+
+  lastSwitchChange=millis();
+
+  return state;
 }
 
 /*__________________________________________________________HELPER_FUNCTIONS__________________________________________________________*/
@@ -167,9 +455,78 @@ void handleIndexHTML(AsyncWebServerRequest *request){
   #ifdef DEBUG
     //Serial.printf("Current temp : %f\n",currentTemp);
   #endif
+  content.replace("__DEVICE_NAME__",ESP_NAME);
   content.replace("__TEMP_DATA__",String(currentTemp).c_str());
   content.replace("__VOLT_DATA__",String(currentVoltage).c_str());
+  content.replace("__SWITCH_DATA__",relayStatus.c_str());
+  content.replace("__THERMOSTAT_DATA__",String(currentThermostat).c_str());
+  content.replace("__UPTIME_DATA__",String(millis()).c_str());
 
+  request->send(200,"text/html",content);
+}
+
+void handleListFS(AsyncWebServerRequest *request){
+  String content ;
+  content+="<html><head><title>Content of SPIFFS</title></head><body>\n";
+  content+= "<h2>List of SPIFFS : </h2>\n";
+
+  Dir dir = SPIFFS.openDir("/");
+  while (dir.next()) {                      // List the file system contents
+    String fileName = dir.fileName();
+    size_t fileSize = dir.fileSize();
+    #ifdef DEBUG
+      Serial.printf("\tFS File: %s, size: %s\r\n", fileName.c_str(), formatBytes(fileSize).c_str());
+    #endif
+
+    String href="" + fileName;
+    content+=" File: <a href='" + href + "'>" + fileName + "</a> (" + formatBytes(fileSize).c_str()  + ")<br>\n";
+  }
+
+  content+="\n</body></html>";
+  request->send(200,"text/html",content);
+}
+
+void handleToggle(AsyncWebServerRequest *request){
+  String newRelayStatus="UNKNOWN";
+  if(relayStatus=="ON"){
+    newRelayStatus="OFF";
+  }else if(relayStatus=="OFF"){
+    newRelayStatus="ON";
+  }
+
+  Homie.getLogger() << "handleToggle Relay: " << newRelayStatus << " (newState))" << endl;
+
+  String content ;
+  content+="<html><head><title>Toggle Relay Status </title></head><body>\n";
+  toggleSwitch(newRelayStatus);
+
+  content+="New Relay State : " + newRelayStatus + "";
+  content+="\n</body></html>";
+  request->send(200,"text/html",content);
+}
+
+void handleSetTrigger(AsyncWebServerRequest *request){
+  String content;
+  String value;
+
+  content+="<html><head><title>Change Trigger</title></head><body>\n";
+
+  if (!request->hasParam("value")) {
+    Homie.getLogger() << "✖ handleSetTrigger need param 'value'" << endl;
+    content+="<h1>NEED PARAM 'value'</h1>";
+    content+="\n</body></html>";
+    request->send(500,"text/html",content);
+    return ;
+  }
+  value=request->getParam("value")->value();
+
+  Homie.getLogger() << "handleSetTrigger new Value : " << value << endl;
+
+  
+  changeThermostat(value);
+  content+="Value : " + value + "<br />\n";
+
+  content+="\n</body></html>";
   request->send(200,"text/html",content);
 }
 
@@ -183,9 +540,11 @@ void handleHomieEvent(const HomieEvent& event) {
   switch(event.type) {
     case HomieEventType::MQTT_READY:
       #ifdef DEBUG
-        Homie.getLogger() << "MQTT connected, preparing for deep sleep after 100ms..." << endl;
+        Homie.getLogger() << "MQTT connected";
+        Homie.getLogger() << ", preparing for deep sleep after 100ms...";
+        Homie.getLogger() << endl;
       #endif
-      t.after(100, prepareSleep);
+      if(ENABLE_DEEP_SLEEP) tTimer.after(100, prepareSleep);
       break;
     case HomieEventType::READY_TO_SLEEP:
       #ifdef DEBUG
@@ -197,7 +556,8 @@ void handleHomieEvent(const HomieEvent& event) {
   }
 }
 
-/* void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to the SPIFFS
+/*
+void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to the SPIFFS
   HTTPUpload& upload = request->upload();
   String path;
   if(upload.status == UPLOAD_FILE_START){
@@ -230,102 +590,203 @@ void handleHomieEvent(const HomieEvent& event) {
   }
 
   request->send(200, "text/plain", "");
-} */
-
-float readVoltValue(){
-  //int value = LOW;
-  //float Tvoltage=0.0;
-  float Vvalue=0.0,Rvalue=0.0;
-
-  uint maxCycleAverage=10;
-
-  // Read 10 value of voltage
-  for(unsigned int i=0;i<maxCycleAverage;i++){
-    Vvalue=Vvalue+analogRead(BAT);         //Read analog Voltage
-    delay(5);                              //ADC stable
-  }
-
-  Vvalue=(float)Vvalue*1.0/maxCycleAverage;   //Find average of 10 values
-
-  #ifdef DEBUG
-    //Serial.printf("Raw ADC Value: %f\n",Vvalue);
-  #endif
-
-  Rvalue=(float)(Vvalue/1024.0)*3.3;            //Convert Voltage in 3.3v factor
-
-  currentVoltage=Rvalue;
-
-  return Rvalue;
-}
+}*/
 
 void handleHomieLoop() {
+  //Homie.getLogger() << "handleHomieLoop() " << endl;
+
   if (millis() - lastTemperatureSent >= DEFAULT_TEMPERATURE_INTERVAL || lastTemperatureSent < 1000) {
     #ifdef DEBUG
-      Homie.getLogger() << "Voltage: " << currentVoltage << " V" << endl;
+      Homie.getLogger() << "Sending MQTT Voltage: " << currentVoltage << " V" << endl;
     #endif
-    voltageNode.setProperty("volts").send(String(currentVoltage));
+    voltageNode.setProperty("volts").send(String(currentVoltage));  // For MQTT/Homie
 
     float temperature = currentTemp;
 
     #ifdef DEBUG
-      Homie.getLogger() << "Temperature: " << temperature << " °C" << endl;
+      Homie.getLogger() << "Sending MQTT Temperature: " << temperature << " °C" << endl;
     #endif
 
-          // Do not transmit the temperature if it's too low
+    // Do not transmit the temperature if it's too low
     if(currentTemp<-5.0){
       Homie.getLogger() << "[ERROR] Temperature is too low !" << endl;
     }else{
-      temperatureNode.setProperty("degrees").send(String(temperature));
+      temperatureNode.setProperty("degrees").send(String(temperature)); // For MQTT/Homie
     }
+
+    #ifdef DEBUG
+      Homie.getLogger() << "Sending MQTT Switch: " << relayStatus << " " << endl;
+      Homie.getLogger() << "Sending MQTT Thermostat: " << currentThermostat << " " << endl;
+    #endif
+
+    // For MQTT/Homie
+    switchNode.setProperty("relay").send(relayStatus);
+    switchNode.setProperty("thermostat").send(String(currentThermostat));
+    switchNode.setProperty("wifi").send(currentWifi);
+    switchNode.setProperty("uptime").send(String(millis()));
     
+    /*String outStr="{";
+    outStr+="\"temp\": "          + String(currentTemp) + ",";
+    outStr+=" \"voltage\": "      + String(currentVoltage) + ",";
+    outStr+=" \"switch\": \""     + relayStatus + "\",";
+    outStr+=" \"thermostat\": \"" + String(currentThermostat) + "\",";
+    outStr+=" \"uptime\": "       + String(millis()) + ",";
+    outStr+="}";
+
+    // Send Infos to All WebSocket clients
+    webSocket.textAll(outStr.c_str());*/
+
     lastTemperatureSent = millis();
   }
+
+  // If Relay has change value
+  if(oldRelayStatus!=relayStatus){
+    #ifdef DEBUG
+      Homie.getLogger() << "Sending Switch: " << relayStatus << " " << endl;
+      Homie.getLogger() << "Sending Thermostat: " << currentThermostat << " " << endl;
+    #endif
+    switchNode.setProperty("relay").send(relayStatus); // For MQTT/Homie
+    switchNode.setProperty("thermostat").send(String(currentThermostat)); // For MQTT/Homie
+
+    // Send Switch Change to WebSocket client
+    webSocket.textAll("{\"switch\": \"" + relayStatus + "\", \"thermostat\": \"" + String(currentThermostat) + "\"}");
+  }
+  
 }
 
-/* void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght) { // When a WebSocket message is received
+//void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t lenght) { // When a WebSocket message is received
+void webSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len){
+  //Serial.printf("[%u] webSocketEvent(%s)!\n", num, type);
+  uint8_t num=0;
+  String tempSTR="";
   switch (type) {
-    case WStype_DISCONNECTED:             // if the websocket is disconnected
+    case WS_EVT_DISCONNECT :             // if the websocket is disconnected
       #ifdef DEBUG
-        Serial.printf("[%u] Disconnected!\n", num);
+        Serial.printf("[%u] WS Disconnected!\n", num);
       #endif
       break;
-    case WStype_CONNECTED: {              // if a new websocket connection is established
-        IPAddress ip = webSocket.remoteIP(num);
+    case WS_EVT_CONNECT: {              // if a new websocket connection is established
+        IPAddress ip = client->remoteIP();
         #ifdef DEBUG
-          Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
+          //Serial.printf("[%u] WS Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], "");
+          Serial.printf("[%u] WS Connected from %s url: %s\n", num, ip.toString().c_str(), "");
         #endif
 
       }
       break;
-    case WStype_TEXT:                     // if new text data is received
+    case WS_EVT_DATA:                     // if new text data is received
+      for(uint i=0; i < len; i++) {
+        tempSTR+=(char)data[i];
+        //Serial.print((char)data[i]);
+        //Serial.print("|");
+      }
       #ifdef DEBUG
-        Serial.printf("[%u] get Text: %s\n", num, payload);
+        Serial.printf("[%u] WS get Text: %s\n", num, tempSTR.c_str());
+        //Serial.println();
       #endif
 
+      // if ask to change state
+      if(tempSTR.startsWith("toggle:")){
+        String state=tempSTR;
+        state.replace("toggle:","");
+
+        // Inverting state
+        if(state.equals("ON")){
+          state="OFF";
+          toggleSwitch(state);
+        }else if(state.equals("OFF")){
+          state="ON";
+          toggleSwitch(state);
+        }
+
+      }else if(tempSTR.startsWith("changeThermostat:")){  // if ask to change thermostat
+        String therm=tempSTR;
+        therm.replace("changeThermostat:","");
+        changeThermostat(therm);
+      }
+
+      
+
       break;
-    case WStype_BIN:
+    /*case WStype_BIN:
       #ifdef DEBUG
         hexdump(payload, lenght);
       #endif
       // echo data back to browser
-      webSocket.sendBIN(num, payload, lenght);
+      webSocket.sendBIN(num, data, lenght);
+      break;*/
+    /*case WStype_PING:                     // if new text data is received
+      #ifdef DEBUG
+        Serial.printf("[%u] WS get PING: %s\n", num, "");
+      #endif
+      //webSocket.sendTXT(num,"PONG");
+      break;*/
+    case WS_EVT_PONG:                     // if new text data is received
+      #ifdef DEBUG
+        Serial.printf("[%u] WS get PONG: %s\n", num, "");
+      #endif
+      client->ping();
+      break;
+    default:
+      #ifdef DEBUG
+        Serial.printf("[%u] WS get unknown %u: %s\n", num, type,  "");
+      #endif
       break;
   }
-} */
+}
 
 void doOneLoop(){
-  sensors.requestTemperatures();
-  currentTemp=sensors.getTempC(T[0].addr);  // Get temp of first sensor
-
+  //Serial.println("   [DEBUG] readTempValue()...");
+  readTempValue();
+  //Serial.println("   [DEBUG] readVoltValue()...");
   readVoltValue();
 
+  //Serial.println("   [DEBUG] processThermostat()...");
+  processThermostat();
+
+  //Serial.println("   [DEBUG] readRelayStatus()...");
+  readRelayStatus();
+
+  //Serial.println("   [DEBUG] readWifiSSID()...");
+  readWifiSSID();
+
+  //Serial.println("   [DEBUG] sendWSAllValues()...");
+  sendWSAllValues();
+
+  #ifdef DEBUG
+  Serial.write("Temperature: ");
+  Serial.print(currentTemp);
+  Serial.print(" °C   ");
+  Serial.write("Voltage: ");
+  Serial.print(currentVoltage);
+  Serial.print(" V   ");
+  Serial.write("State: ");
+  Serial.print(relayStatus);
+  Serial.print("   ");
+  Serial.write("Thermostat: ");
+  Serial.print(currentThermostat);
+  Serial.print(" °C   ");
+  Serial.print("   ");
+  Serial.write("Uptime: ");
+  Serial.print(millis());
+  Serial.print(" ms   ");
+  Serial.print("   ");
+  Serial.write("Wifi: ");
+  Serial.print(currentWifi);
+  Serial.print("   ");
+  Serial.write("deviceCount: ");
+  Serial.print(deviceCount);
+  Serial.println("");
+  #endif
+
   Homie.loop();
-  t.update();   // Update the timer
+  tTimer.update();   // Update the timer (for deep sleep mode)
 
   if(ENABLE_DEEP_SLEEP) return; // If DEEP SLEEP MODE, we stop here
 
   //webSocket.loop();                           // constantly check for websocket events
   //server.handleClient();                      // run the server
+  
   ArduinoOTA.handle();                        // listen for OTA events
 }
 
@@ -371,6 +832,8 @@ void doOneLoop(){
 } */
 
 void startOTA() { // Start the OTA service
+  Serial.println("[INIT] Starting OTA...");
+
   ArduinoOTA.setHostname(OTAName);
   ArduinoOTA.setPassword(OTAPassword);
 
@@ -432,15 +895,17 @@ void startSPIFFS() { // Start the SPIFFS and list all contents
   }
 }
 
-/* void startWebSocket() { // Start a WebSocket server
-  webSocket.begin();                          // start the websocket server
+void startWebSocket() { // Start a WebSocket server
+  Serial.println("[INIT] Starting WebSocket...");
+  //webSocket.begin();                          // start the websocket server
   webSocket.onEvent(webSocketEvent);          // if there's an incomming websocket message, go to function 'webSocketEvent'
   #ifdef DEBUG
     Serial.println("WebSocket server started.");
   #endif
-} */
+}
 
 void startMDNS() { // Start the mDNS responder
+  Serial.println("[INIT] Starting MDNS Responder...");
   MDNS.begin(mdnsName);                        // start the multicast domain name server
   #ifdef DEBUG
     Serial.print("mDNS responder started: http://");
@@ -450,10 +915,15 @@ void startMDNS() { // Start the mDNS responder
 }
 
 void startServer() { // Start a HTTP server with a file read handler and an upload handler
+  Serial.println("[INIT] Starting WebServer...");
   //server.on("/edit.html",  HTTP_POST, handleFileUpload);                       // go to 'handleFileUpload'
 
-  server.on("/",  handleIndexHTML);                       // go to 'handleIndexHTML'
-  server.on("/data.json",  handleDataJSON);               // go to 'handleDataJSON'
+  server.addHandler(&webSocket);                          // Mapping of WebSocke
+  server.on("/",            handleIndexHTML);             // go to 'handleIndexHTML'
+  server.on("/data.json",   handleDataJSON);              // go to 'handleDataJSON'
+  server.on("/ls",          handleListFS);                // go to 'handleListFS'
+  server.on("/toggle",      handleToggle);                // go to 'handleToggle'
+  server.on("/setTrigger",  handleSetTrigger);            // go to 'handleSetTrigger'
 
   server.onNotFound(handleNotFound);          // if someone requests any other file or page, go to function 'handleNotFound'
                                               // and check if the file exists
@@ -465,7 +935,7 @@ void startServer() { // Start a HTTP server with a file read handler and an uplo
 }
 
 void startHomie(){
-  Homie_setFirmware(ESP_NAME, "1.0.0");
+  Homie_setFirmware(ESP_NAME, ESP_FIRMWARE_VERSION);
   Homie.setLoopFunction(handleHomieLoop);
 
   Homie.onEvent(handleHomieEvent);    // Configure Homie Event Handler
@@ -481,6 +951,20 @@ void startHomie(){
   voltageNode.advertise("volts").setName("Volts")
                                     .setDatatype("float")
                                     .setUnit("V");
+
+  switchNode.advertise("thermostat").setName("Thermostat")
+                                      .setDatatype("float")
+                                      .setUnit("°C");
+
+  switchNode.advertise("relay").setName("Relai")
+                                      .setDatatype("string");
+
+  switchNode.advertise("wifi").setName("wifi")
+                                    .setDatatype("string");
+
+  switchNode.advertise("uptime").setName("uptime")
+                                    .setDatatype("integer")
+                                    .setUnit("ms");
 
   temperatureIntervalSetting.setDefaultValue(DEFAULT_TEMPERATURE_INTERVAL).setValidator([] (long candidate) {
     return candidate > 0;
@@ -500,63 +984,50 @@ void startHomie(){
 } */
 
 
-
 void setup(void){
   Serial.begin(115200);
+  optimistic_yield(300);
 
-  #ifdef DEBUG
-    Serial.println(__FILE__);
-    Serial.println("Dallas Temperature Demo");
-  #endif
+  Serial.println("\n\n[INIT] Setting...");
 
-  sensors.begin();
-  
-  // count devices
-  deviceCount = sensors.getDeviceCount();
-  #ifdef DEBUG
-    Serial.print("#devices: ");
-    Serial.println(deviceCount);
-  #endif
+  setupTemp();
 
-  // Read ID's per sensor
-  // and put them in T array
-  for (uint8_t index = 0; index < deviceCount; index++){
-    // go through sensors
-    sensors.getAddress(T[index].addr, index);
-    T[index].id = sensors.getUserData(T[index].addr);
-  }
-
-  // Check all 4 sensors are set
-  #ifdef DEBUG
-    for (uint8_t index = 0; index < deviceCount; index++){
-      Serial.println();
-      Serial.println(T[index].id);
-      printAddress(T[index].addr);
-      Serial.println();
-    }
-    Serial.println();
-  #endif
+  setupAR53002();
 
   //startWiFi();                 // Start a Wi-Fi access point, and try to connect to some given access points. Then wait for either an AP or STA connection
   startHomie();                // Starting the MQTT Provider
+  Serial.println("\n[INIT] Homie Started.");
 
   if(ENABLE_DEEP_SLEEP) return ;
-  
+
   /* if(ENABLE_DEEP_SLEEP)         
-    return startDeepSleep();   // If DEEP SLEEP MODE, We stop here */
+  return startDeepSleep();   // If DEEP SLEEP MODE, We stop here */
 
   startOTA();                  // Start the OTA service
   startSPIFFS();               // Start the SPIFFS and list all contents
-  //startWebSocket();            // Start a WebSocket server
+  startWebSocket();            // Start a WebSocket server
   startMDNS();                 // Start the mDNS responder
   startServer();               // Start a HTTP server with a file read handler and an upload handler
+
+  Serial.println("[INIT] First Read of Thermostat state...");
+  readThermostatValue(); // Should be done AFTER startSPIFFS
+
+  Serial.println("Starting loop...");
 }
 
+unsigned long lastTS=0;
 
 void loop(void){
-  doOneLoop();
+    if(HAVE_TO_PULSE) sendPulseToSwitch();
+    //Serial.println(".");
+    //optimistic_yield(1000);
 
-  optimistic_yield(1000);
+    // Only 1 refresh by second
+    if(millis()-lastTS>1000 or millis()<lastTS){
+      //Serial.println(""); // For newline after "."
+      lastTS=millis();
+      doOneLoop();
+    }
+
+    delay(100);
 }
-
-// END OF FILE
