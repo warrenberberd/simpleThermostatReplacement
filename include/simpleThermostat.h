@@ -19,17 +19,22 @@
 #endif
 
 #include <Timer.h>
-#include <FS.h>
+#include <LittleFS.h>
 //#include <WebSocketsServer.h>
 
 #define THERMOSTAT_FILE  "/thermostat.conf"
 
-#define DEFAULT_TEMPERATURE_INTERVAL 30000  // Temperature Interval in Milliseconds
+#define DEFAULT_TEMPERATURE_INTERVAL 80000  // Temperature Interval in Milliseconds
+#define DEFAULT_THERMOSTAT_INTERVAL  100000 // Thermostat Interval in Milliseconds
 #define DEFAULT_SWITCH_INTERVAL      180000 // Switch Flip/Flop internval in milliseconds
 //#define DEFAULT_SWITCH_INTERVAL      1800 // Switch Flip/Flop internval in milliseconds
 
+#ifdef ENABLE_DEEP_SLEEP
+#define ENABLE_DEEP_SLEEP true
+#define DEEP_SLEEP_INTERVAL 30000000  // Interval of deepsleep in microSecond
+#else
 #define ENABLE_DEEP_SLEEP false
-//#define DEEP_SLEEP_INTERVAL 30000000  // Interval of deepsleep in microSecond
+#endif
 
 #define ESP_FIRMWARE_VERSION "0.8.0"
 #define ESP_NAME "THERMOSTAT_DATA_LOGGER"

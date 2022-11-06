@@ -59,6 +59,7 @@ HomieSetting<long> temperatureIntervalSetting("temperatureInterval", "The temper
 
 HomieNode voltageNode("voltage", "Voltage", "voltage");
 HomieNode switchNode("thermostat", "Thermostat", "thermostat");
+//HomieSetting<long> thermostatIntervalSetting("thermostatInterval", "The thermostat interval in seconds");
 
 Timer tTimer;    // For DeepSleep
 
@@ -73,7 +74,10 @@ struct{
   DeviceAddress addr;
 } T[4];
 
-ICACHE_RAM_ATTR void callbackResetSwitch(){
+IRAM_ATTR void callbackResetSwitch(){
+#ifdef DEBUG
+  Serial.println("[DEBUG] callbackResetSwitch()...");
+#endif
   ESP.reset();
 }
 
@@ -148,6 +152,9 @@ bool setupAR53002(){
 
 // Reading VOLT Value from ADC (A0)
 float readVoltValue(){
+#ifdef DEBUG
+  Serial.println("   [DEBUG] readVoltValue()...");
+#endif
   //int value = LOW;
   //float Tvoltage=0.0;
   float Vvalue=0.0,Rvalue=0.0;
@@ -175,16 +182,19 @@ float readVoltValue(){
 
 // Reading temperature from DS2013
 float readTempValue(){
+#ifdef DEBUG
+  Serial.println("   [DEBUG] readTempValue()...");
+#endif
   // If not initialized, run setupTemp
   if(T[0].addr==0 || deviceCount==0) setupTemp();
 
-  //Serial.println("    [DEBUG] requestTemperatures()...");
+  //Serial.println("   [DEBUG] requestTemperatures()...");
   if(sensors.isConversionComplete()){
     sensors.requestTemperatures();  // Take 480ms
 
-    //Serial.println("    [DEBUG] getTempC()...");
+    //Serial.println("   [DEBUG] getTempC()...");
     currentTemp=sensors.getTempC(T[0].addr);  // Get temp of first sensor
-    //Serial.println("    [DEBUG] readTempValue() OK.");
+    //Serial.println("   [DEBUG] readTempValue() OK.");
   }
 
   return currentTemp;
@@ -200,13 +210,18 @@ void sendWSAllValues(){
   outStr+=" \"uptime\": "       + String(millis()) + "";
   outStr+="}";
 
+#ifndef NO_WEBSOCKET
   // Send Infos to All WebSocket clients
   webSocket.textAll(outStr.c_str());
   //webSocket.textAll("{\"temp\": " + String(currentTemp) + ", \"uptime\": "       + String(millis()) + "}");
+#endif
 }
 
 // Lecture de la LED d'indication d'état du relai
 String readRelayStatus(){
+#ifdef DEBUG
+  Serial.println("   [DEBUG] readRelayStatus()...");
+#endif
   int state = digitalRead(AR53002_LED_PIN);
   int led_state=state;
 
@@ -237,8 +252,11 @@ String readRelayStatus(){
 
 // Read Thermostat from config file
 float readThermostatValue(){
+#ifdef DEBUG
+  Serial.println("[DEBUG] readThermostatValue()...");
+#endif
   String path=THERMOSTAT_FILE;
-  if(!SPIFFS.exists(path)){
+  if(!LittleFS.exists(path)){
     #ifdef DEBUG
       Homie.getLogger() << "Thermostat File does not exists. Returning default" << endl;
     #endif
@@ -246,7 +264,7 @@ float readThermostatValue(){
     return currentThermostat; 
   }
 
-  File file = SPIFFS.open(path, "r");
+  File file = LittleFS.open(path, "r");
   String content=file.readString();
   file.close();
 
@@ -263,9 +281,14 @@ String readWifiSSID(){
 
 // Save Thermostat in config file
 bool writeThermostatValue(float ther){
+#ifdef DEBUG
+  Serial.println("[DEBUG] writeThermostatValue()...");
+#endif
+  //return false;
+
   String path=THERMOSTAT_FILE;
 
-  File file = SPIFFS.open(path, "w");
+  File file = LittleFS.open(path, "w");
   file.write(String(ther).c_str());
   file.close();
 
@@ -307,8 +330,9 @@ bool sendPulseToSwitch(){
     return true;
   }
 
+#ifndef NO_WEBSOCKET
   webSocket.textAll("{\"switch\": \"" + relayStatus + "\"}");
-
+#endif
   return false;
 }
 
@@ -316,7 +340,7 @@ bool toggleSwitch(String newState){
   #ifdef DEBUG
     Homie.getLogger() << "Toggle Relay: " << newState << " (newState))" << endl;
   #endif
-  uint state;
+  uint state=HIGH;
   if(newState=="ON" && relayStatus=="OFF"){
     //sendPulseToSwitch();  // Send pulse to change Switch state
     HAVE_TO_PULSE=true;
@@ -412,17 +436,17 @@ bool handleFileRead(AsyncWebServerRequest *request,String path) { // send the ri
   String contentType = getContentType(path);             // Get the MIME type
   String pathWithGz = path + ".gz";
   bool download=false;
-  if (SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
+  if (LittleFS.exists(pathWithGz) || LittleFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
 
-    if (SPIFFS.exists(pathWithGz))                         // If there's a compressed version available
+    if (LittleFS.exists(pathWithGz))                         // If there's a compressed version available
       path += ".gz";                                         // Use the compressed verion
-    //File file = SPIFFS.open(path, "r");                    // Open the file
+    //File file = LittleFS.open(path, "r");                    // Open the file
     //request->send(file, contentType,file.size());    // Send it to the client
 
-    AsyncWebServerResponse *response = request->beginResponse(SPIFFS, path,contentType,download);
+    AsyncWebServerResponse *response = request->beginResponse(LittleFS, path,contentType,download);
     response->addHeader("Cache-Control","max-age=3600");
     request->send(response);
-    //request->send(SPIFFS, path,contentType,download);
+    //request->send(LittleFS, path,contentType,download);
     //file.close();                                          // Close the file again
     #ifdef DEBUG
       Serial.println(String("\tSent file: ") + path);
@@ -436,10 +460,17 @@ bool handleFileRead(AsyncWebServerRequest *request,String path) { // send the ri
 }
 
 void handleDataJSON(AsyncWebServerRequest *request){
+  #ifdef DEBUG
   Serial.printf("Current temp : %f\n",currentTemp);
+  #endif
 
   String content="{\n";
-  content+="\"temperature\": " + String(currentTemp) + "\n";
+  content+="\"temp\": "          + String(currentTemp) + ",";
+  content+=" \"voltage\": "      + String(currentVoltage) + ",";
+  content+=" \"switch\": \""     + relayStatus + "\",";
+  content+=" \"thermostat\": \"" + String(currentThermostat) + "\",";
+  content+=" \"wifi\": \""       + String(currentWifi) + "\",";
+  content+=" \"uptime\": "       + String(millis()) + "";
   content+="}\n";
 
   request->send(200,"application/json",content);
@@ -448,7 +479,7 @@ void handleDataJSON(AsyncWebServerRequest *request){
 void handleIndexHTML(AsyncWebServerRequest *request){
   String path="/index.html";
 
-  File file = SPIFFS.open(path, "r");
+  File file = LittleFS.open(path, "r");
   String content=file.readString();
   file.close();
 
@@ -467,10 +498,10 @@ void handleIndexHTML(AsyncWebServerRequest *request){
 
 void handleListFS(AsyncWebServerRequest *request){
   String content ;
-  content+="<html><head><title>Content of SPIFFS</title></head><body>\n";
-  content+= "<h2>List of SPIFFS : </h2>\n";
+  content+="<html><head><title>Content of LittleFS</title></head><body>\n";
+  content+= "<h2>List of LittleFS : </h2>\n";
 
-  Dir dir = SPIFFS.openDir("/");
+  Dir dir = LittleFS.openDir("/");
   while (dir.next()) {                      // List the file system contents
     String fileName = dir.fileName();
     size_t fileSize = dir.fileSize();
@@ -531,18 +562,20 @@ void handleSetTrigger(AsyncWebServerRequest *request){
 }
 
 void handleNotFound(AsyncWebServerRequest *request){ // if the requested file or page doesn't exist, return a 404 not found error
-  if(!handleFileRead(request,request->url())){          // check if the file exists in the flash memory (SPIFFS), if so, send it
+  if(!handleFileRead(request,request->url())){          // check if the file exists in the flash memory (LittleFS), if so, send it
     request->send(404, "text/plain", "404: File Not Found");
   }
 }
 
 void handleHomieEvent(const HomieEvent& event) {
+  //return ; // Debug exit
+#ifdef DEBUG
+  Serial.println("[DEBUG]  handleHomieEvent()...");
+#endif
   switch(event.type) {
     case HomieEventType::MQTT_READY:
       #ifdef DEBUG
-        Homie.getLogger() << "MQTT connected";
-        Homie.getLogger() << ", preparing for deep sleep after 100ms...";
-        Homie.getLogger() << endl;
+        Homie.getLogger() << "MQTT connected, preparing for deep sleep after 100ms..." << endl;
       #endif
       if(ENABLE_DEEP_SLEEP) tTimer.after(100, prepareSleep);
       break;
@@ -553,11 +586,33 @@ void handleHomieEvent(const HomieEvent& event) {
   
       if(ENABLE_DEEP_SLEEP) Homie.doDeepSleep(deepSleeIntervalSetting.get() * 1000000);
       break;
+
+    case HomieEventType::STANDALONE_MODE:
+    case HomieEventType::CONFIGURATION_MODE:
+    case HomieEventType::NORMAL_MODE:
+    case HomieEventType::OTA_STARTED:
+    case HomieEventType::OTA_PROGRESS:
+    case HomieEventType::OTA_SUCCESSFUL:
+    case HomieEventType::OTA_FAILED:
+    case HomieEventType::ABOUT_TO_RESET:
+    case HomieEventType::WIFI_CONNECTED:
+    case HomieEventType::WIFI_DISCONNECTED:
+    case HomieEventType::MQTT_DISCONNECTED:
+    case HomieEventType::MQTT_PACKET_ACKNOWLEDGED:
+    case HomieEventType::SENDING_STATISTICS:
+    #ifdef DEBUG
+      Homie.getLogger() << "  [DEBUG] Received  HomieEventType:" << (unsigned int)event.type << endl;
+    #endif
+      break;
   }
+
+#ifdef DEBUG
+  Serial.println("[DEBUG] End of handleHomieEvent.");
+#endif
 }
 
 /*
-void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to the SPIFFS
+void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to the LittleFS
   HTTPUpload& upload = request->upload();
   String path;
   if(upload.status == UPLOAD_FILE_START){
@@ -565,13 +620,13 @@ void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to t
     if(!path.startsWith("/")) path = "/"+path;
     if(!path.endsWith(".gz")) {                          // The file server always prefers a compressed version of a file 
       String pathWithGz = path+".gz";                    // So if an uploaded file is not compressed, the existing compressed
-      if(SPIFFS.exists(pathWithGz))                      // version of that file must be deleted (if it exists)
-         SPIFFS.remove(pathWithGz);
+      if(LittleFS.exists(pathWithGz))                      // version of that file must be deleted (if it exists)
+         LittleFS.remove(pathWithGz);
     }
     #ifdef DEBUG
     Serial.print("handleFileUpload Name: "); Serial.println(path);
     #endif
-    fsUploadFile = SPIFFS.open(path, "w");            // Open the file for writing in SPIFFS (create if it doesn't exist)
+    fsUploadFile = LittleFS.open(path, "w");            // Open the file for writing in LittleFS (create if it doesn't exist)
     path = String();
   } else if(upload.status == UPLOAD_FILE_WRITE){
     if(fsUploadFile)
@@ -593,7 +648,10 @@ void handleFileUpload(AsyncWebServerRequest *request){ // upload a new file to t
 }*/
 
 void handleHomieLoop() {
-  //Homie.getLogger() << "handleHomieLoop() " << endl;
+  optimistic_yield(300);
+#ifdef DEBUG
+  Serial.println("[DEBUG] handleHomieLoop()...");
+#endif
 
   if (millis() - lastTemperatureSent >= DEFAULT_TEMPERATURE_INTERVAL || lastTemperatureSent < 1000) {
     #ifdef DEBUG
@@ -624,7 +682,6 @@ void handleHomieLoop() {
     switchNode.setProperty("thermostat").send(String(currentThermostat));
     switchNode.setProperty("wifi").send(currentWifi);
     switchNode.setProperty("uptime").send(String(millis()));
-    
     /*String outStr="{";
     outStr+="\"temp\": "          + String(currentTemp) + ",";
     outStr+=" \"voltage\": "      + String(currentVoltage) + ",";
@@ -647,9 +704,14 @@ void handleHomieLoop() {
     #endif
     switchNode.setProperty("relay").send(relayStatus); // For MQTT/Homie
     switchNode.setProperty("thermostat").send(String(currentThermostat)); // For MQTT/Homie
-
     // Send Switch Change to WebSocket client
+#ifndef NO_WEBSOCKET
     webSocket.textAll("{\"switch\": \"" + relayStatus + "\", \"thermostat\": \"" + String(currentThermostat) + "\"}");
+#endif
+
+#ifdef DEBUG
+  Serial.println("[DEBUG] End of handleHomieLoop().");
+#endif
   }
   
 }
@@ -736,25 +798,35 @@ void webSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsE
 }
 
 void doOneLoop(){
-  //Serial.println("   [DEBUG] readTempValue()...");
-  readTempValue();
-  //Serial.println("   [DEBUG] readVoltValue()...");
-  readVoltValue();
+  optimistic_yield(300);
 
-  //Serial.println("   [DEBUG] processThermostat()...");
+  readTempValue();
+  optimistic_yield(300);
+  readVoltValue();
+  optimistic_yield(300);
+
+#ifdef DEBUG
+  Serial.println("   [DEBUG] processThermostat()...");
+#endif
   processThermostat();
 
-  //Serial.println("   [DEBUG] readRelayStatus()...");
   readRelayStatus();
 
-  //Serial.println("   [DEBUG] readWifiSSID()...");
+#ifdef DEBUG
+  Serial.println("   [DEBUG] readWifiSSID()...");
+#endif
   readWifiSSID();
 
-  //Serial.println("   [DEBUG] sendWSAllValues()...");
+#ifndef NO_WEBSOCKET
+#ifdef DEBUG
+  Serial.println("   [DEBUG] sendWSAllValues()...");
+#endif
   sendWSAllValues();
+  optimistic_yield(300);
+#endif
 
-  #ifdef DEBUG
-  Serial.write("Temperature: ");
+#ifdef DEBUG
+  Serial.write("   Temperature: ");
   Serial.print(currentTemp);
   Serial.print(" °C   ");
   Serial.write("Voltage: ");
@@ -777,17 +849,42 @@ void doOneLoop(){
   Serial.write("deviceCount: ");
   Serial.print(deviceCount);
   Serial.println("");
-  #endif
+  optimistic_yield(300);
+#endif
 
+#ifndef NO_HOMIE
+#ifdef DEBUG
+  Serial.println("   [DEBUG] Homie.loop()...");
+#endif
   Homie.loop();
+#endif
+
+#ifdef DEBUG
+  Serial.println("   [DEBUG] tTimer.update()...");
+#endif
   tTimer.update();   // Update the timer (for deep sleep mode)
 
-  if(ENABLE_DEEP_SLEEP) return; // If DEEP SLEEP MODE, we stop here
+  if(ENABLE_DEEP_SLEEP){
+#ifdef DEBUG
+  Serial.println("   [DEBUG] Break to Deep Sleep()...");
+#endif
+    return; // If DEEP SLEEP MODE, we stop here
+  }
 
   //webSocket.loop();                           // constantly check for websocket events
   //server.handleClient();                      // run the server
-  
+
+#ifndef NO_OTA
+#ifdef DEBUG
+  Serial.println("   [DEBUG] ArduinoOTA.handle()...");
+#endif
   ArduinoOTA.handle();                        // listen for OTA events
+#endif
+
+#ifdef DEBUG
+   Serial.println("   [DEBUG] End of doOneLoop().");
+#endif
+  
 }
 
 /*__________________________________________________________SETUP_FUNCTIONS__________________________________________________________*/
@@ -875,13 +972,13 @@ void startOTA() { // Start the OTA service
   #endif
 }
 
-void startSPIFFS() { // Start the SPIFFS and list all contents
-  SPIFFS.begin();                             // Start the SPI Flash File System (SPIFFS)
+void startLittleFS() { // Start the LittleFS and list all contents
+  LittleFS.begin();                             // Start the SPI Flash File System (LittleFS)
   #ifdef DEBUG
-    Serial.println("SPIFFS started. Contents:");
+    Serial.println("LittleFS started. Contents:");
   #endif
   {
-    Dir dir = SPIFFS.openDir("/");
+    Dir dir = LittleFS.openDir("/");
     while (dir.next()) {                      // List the file system contents
       String fileName = dir.fileName();
       size_t fileSize = dir.fileSize();
@@ -896,12 +993,14 @@ void startSPIFFS() { // Start the SPIFFS and list all contents
 }
 
 void startWebSocket() { // Start a WebSocket server
+#ifndef NO_WEBSOCKET
   Serial.println("[INIT] Starting WebSocket...");
   //webSocket.begin();                          // start the websocket server
   webSocket.onEvent(webSocketEvent);          // if there's an incomming websocket message, go to function 'webSocketEvent'
   #ifdef DEBUG
     Serial.println("WebSocket server started.");
   #endif
+#endif
 }
 
 void startMDNS() { // Start the mDNS responder
@@ -935,14 +1034,17 @@ void startServer() { // Start a HTTP server with a file read handler and an uplo
 }
 
 void startHomie(){
+  Serial.println("");
   Homie_setFirmware(ESP_NAME, ESP_FIRMWARE_VERSION);
   Homie.setLoopFunction(handleHomieLoop);
 
   Homie.onEvent(handleHomieEvent);    // Configure Homie Event Handler
 
-  deepSleeIntervalSetting.setDefaultValue(60).setValidator([] (long candidate) {
-    return (candidate > 0) && (candidate < 71*60);
-  });
+#ifdef ENABLE_DEEP_SLEEP
+    deepSleeIntervalSetting.setDefaultValue(60).setValidator([] (long candidate) {
+      return (candidate > 0) && (candidate < 71*60);
+    });
+#endif
 
   temperatureNode.advertise("degrees").setName("Degrees")
                                     .setDatatype("float")
@@ -958,20 +1060,29 @@ void startHomie(){
 
   switchNode.advertise("relay").setName("Relai")
                                       .setDatatype("string");
-
+/* TODO : Why this cause DT at first loop !?!?!?
   switchNode.advertise("wifi").setName("wifi")
-                                    .setDatatype("string");
+                                    .setDatatype("string");*/
 
   switchNode.advertise("uptime").setName("uptime")
                                     .setDatatype("integer")
                                     .setUnit("ms");
 
+
   temperatureIntervalSetting.setDefaultValue(DEFAULT_TEMPERATURE_INTERVAL).setValidator([] (long candidate) {
+    // Only report positive temp
     return candidate > 0;
   });
 
+  /*thermostatIntervalSetting.setDefaultValue(DEFAULT_THERMOSTAT_INTERVAL).setValidator([] (long candidate) {
+    // Only report positive temp
+    return candidate > 0;
+  });*/
+
+
   //Homie.setLedPin(16, HIGH); // before Homie.setup() -- 2nd param is the state of the pin when the LED is o
   //Homie.disableLedFeedback(); // before Homie.setup()
+  
   Homie.setup();
 }
 
@@ -988,46 +1099,83 @@ void setup(void){
   Serial.begin(115200);
   optimistic_yield(300);
 
+#ifdef DEBUG
   Serial.println("\n\n[INIT] Setting...");
+#endif
 
   setupTemp();
 
   setupAR53002();
 
   //startWiFi();                 // Start a Wi-Fi access point, and try to connect to some given access points. Then wait for either an AP or STA connection
+#ifndef NO_HOMIE
   startHomie();                // Starting the MQTT Provider
+#endif
+#ifdef DEBUG
   Serial.println("\n[INIT] Homie Started.");
-
+#endif
   if(ENABLE_DEEP_SLEEP) return ;
 
   /* if(ENABLE_DEEP_SLEEP)         
   return startDeepSleep();   // If DEEP SLEEP MODE, We stop here */
 
+#ifndef NO_OTA
   startOTA();                  // Start the OTA service
-  startSPIFFS();               // Start the SPIFFS and list all contents
+#endif
+  startLittleFS();             // Start the LittleFS and list all contents
+#ifndef NO_WEBSOCKET
   startWebSocket();            // Start a WebSocket server
+#endif
+#ifndef NO_MDNS
   startMDNS();                 // Start the mDNS responder
+#endif
+#ifndef NO_SERVER
   startServer();               // Start a HTTP server with a file read handler and an upload handler
+#endif
 
+#ifdef DEBUG
   Serial.println("[INIT] First Read of Thermostat state...");
-  readThermostatValue(); // Should be done AFTER startSPIFFS
+#endif
+  readThermostatValue(); // Should be done AFTER startLittleFS
 
+  delay(1000);
   Serial.println("Starting loop...");
 }
 
 unsigned long lastTS=0;
 
 void loop(void){
-    if(HAVE_TO_PULSE) sendPulseToSwitch();
+  optimistic_yield(1000);
+
+#ifdef DEBUG
+  Serial.println("[DEBUG] loop...");
+#endif
+
+    if(HAVE_TO_PULSE){
+#ifdef DEBUG
+      Serial.println("   sendPulseToSwitch()...");
+#endif
+      sendPulseToSwitch();
+    }
     //Serial.println(".");
-    //optimistic_yield(1000);
 
     // Only 1 refresh by second
     if(millis()-lastTS>1000 or millis()<lastTS){
       //Serial.println(""); // For newline after "."
       lastTS=millis();
+
+#ifdef DEBUG
+      Serial.println("   doOneLoop()...");
+#endif
       doOneLoop();
     }
 
-    delay(100);
+#ifdef DEBUG
+      Serial.println("   [DEBUG] delay()...");
+#endif
+    optimistic_yield(100);
+    delay(10);
+#ifdef DEBUG
+      Serial.println("   [DEBUG] End of loop.");
+#endif
 }
