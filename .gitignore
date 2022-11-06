@@ -5,3 +5,6 @@
 .vscode/ipch
 include/WiFiCred.h
 data/homie/config.json
+data/homie/configRenescure.json
+data/homie/configHazebrouck.json
+data/homie/configMultiple.json
