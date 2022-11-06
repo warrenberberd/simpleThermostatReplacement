@@ -43,12 +43,15 @@ uint8_t deviceCount = 0;
 unsigned long lastTemperatureSent = 0;  // When we last set the temperature
 unsigned long lastSwitchChange = 0;  // When we last change switch State
 
-float currentTemp=-127.00;
-float currentThermostat=25.00;    // The default wanted temperature
+float currentTemp=-127.0;
+float currentThermostat=25.0;    // The default wanted temperature
 float currentVoltage=99.99;
 String relayStatus="UNKNOWN";
 String oldRelayStatus="UNKNOWN";
 String currentWifi="UNKNOWN";
+
+unsigned int bypassLoop = 7;
+unsigned int loopCount = 0;
 
 //bool switchState=false;
 
@@ -252,23 +255,36 @@ String readRelayStatus(){
 
 // Read Thermostat from config file
 float readThermostatValue(){
+  // TODO : Pour l'instant writeThermostatValue fait planter le LittlFS
+  //return currentThermostat;
+
 #ifdef DEBUG
   Serial.println("[DEBUG] readThermostatValue()...");
 #endif
   String path=THERMOSTAT_FILE;
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
   if(!LittleFS.exists(path)){
+    if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
     #ifdef DEBUG
       Homie.getLogger() << "Thermostat File does not exists. Returning default" << endl;
     #endif
-    currentThermostat=25.0;   // Default value
+    Serial.print("[DEBUG] Default currentThermostat: ");
+    Serial.println(currentThermostat);
+
+    //currentThermostat=25.00;   // Default value
     return currentThermostat; 
   }
 
   File file = LittleFS.open(path, "r");
   String content=file.readString();
   file.close();
+  content.trim();
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
 
   currentThermostat=content.toFloat();
+  Serial.print("[DEBUG] currentThermostat: ");
+  Serial.println(currentThermostat);
+
   return currentThermostat;
 }
 
@@ -281,6 +297,10 @@ String readWifiSSID(){
 
 // Save Thermostat in config file
 bool writeThermostatValue(float ther){
+  // TODO : La fonction corromp le FS pour l'instant, on touche a rien...
+  currentThermostat=ther;
+  return true;
+
 #ifdef DEBUG
   Serial.println("[DEBUG] writeThermostatValue()...");
 #endif
@@ -288,11 +308,16 @@ bool writeThermostatValue(float ther){
 
   String path=THERMOSTAT_FILE;
 
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
   File file = LittleFS.open(path, "w");
   file.write(String(ther).c_str());
   file.close();
+  Serial.println("[DEBUG] writeThermostatValue() : " + String(ther));
 
-  currentThermostat=ther;
+  if(CLOSE_LITTLEFS_EACH_TIME){
+    LittleFS.end();
+    return true;
+  }
 
   return true;
 }
@@ -436,6 +461,7 @@ bool handleFileRead(AsyncWebServerRequest *request,String path) { // send the ri
   String contentType = getContentType(path);             // Get the MIME type
   String pathWithGz = path + ".gz";
   bool download=false;
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
   if (LittleFS.exists(pathWithGz) || LittleFS.exists(path)) { // If the file exists, either as a compressed archive, or normal
 
     if (LittleFS.exists(pathWithGz))                         // If there's a compressed version available
@@ -451,11 +477,13 @@ bool handleFileRead(AsyncWebServerRequest *request,String path) { // send the ri
     #ifdef DEBUG
       Serial.println(String("\tSent file: ") + path);
     #endif
+    if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
     return true;
   }
   #ifdef DEBUG
     Serial.println(String("\tFile Not Found: ") + path);   // If the file doesn't exist, return false
   #endif
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
   return false;
 }
 
@@ -479,9 +507,11 @@ void handleDataJSON(AsyncWebServerRequest *request){
 void handleIndexHTML(AsyncWebServerRequest *request){
   String path="/index.html";
 
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
   File file = LittleFS.open(path, "r");
   String content=file.readString();
   file.close();
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
 
   #ifdef DEBUG
     //Serial.printf("Current temp : %f\n",currentTemp);
@@ -501,6 +531,7 @@ void handleListFS(AsyncWebServerRequest *request){
   content+="<html><head><title>Content of LittleFS</title></head><body>\n";
   content+= "<h2>List of LittleFS : </h2>\n";
 
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
   Dir dir = LittleFS.openDir("/");
   while (dir.next()) {                      // List the file system contents
     String fileName = dir.fileName();
@@ -512,6 +543,8 @@ void handleListFS(AsyncWebServerRequest *request){
     String href="" + fileName;
     content+=" File: <a href='" + href + "'>" + fileName + "</a> (" + formatBytes(fileSize).c_str()  + ")<br>\n";
   }
+
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
 
   content+="\n</body></html>";
   request->send(200,"text/html",content);
@@ -797,6 +830,28 @@ void webSocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsE
   }
 }
 
+void printListFS(){
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.begin();
+  Dir dir = LittleFS.openDir("/");
+  while (dir.next()) {                      // List the file system contents
+    String fileName = dir.fileName();
+    size_t fileSize = dir.fileSize();
+    Serial.printf("\tFS File: /%s, size: %s\r\n", fileName.c_str(), formatBytes(fileSize).c_str());
+
+    if(dir.isDirectory()){
+      Dir subdir = LittleFS.openDir("/" + dir.fileName());
+      String parent=fileName;
+      while (subdir.next()) {  
+        fileName = subdir.fileName();
+        fileSize = subdir.fileSize();
+
+        Serial.printf("\tFS File: /%s/%s, size: %s\r\n", parent.c_str() , fileName.c_str(), formatBytes(fileSize).c_str());
+      }
+    }
+  }
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
+}
+
 void doOneLoop(){
   optimistic_yield(300);
 
@@ -975,21 +1030,10 @@ void startOTA() { // Start the OTA service
 void startLittleFS() { // Start the LittleFS and list all contents
   LittleFS.begin();                             // Start the SPI Flash File System (LittleFS)
   #ifdef DEBUG
-    Serial.println("LittleFS started. Contents:");
+    Serial.println("LittleFS started.");
   #endif
-  {
-    Dir dir = LittleFS.openDir("/");
-    while (dir.next()) {                      // List the file system contents
-      String fileName = dir.fileName();
-      size_t fileSize = dir.fileSize();
-      #ifdef DEBUG
-        Serial.printf("\tFS File: %s, size: %s\r\n", fileName.c_str(), formatBytes(fileSize).c_str());
-      #endif
-    }
-    #ifdef DEBUG
-      Serial.printf("\n");
-    #endif
-  }
+
+  if(CLOSE_LITTLEFS_EACH_TIME) LittleFS.end();
 }
 
 void startWebSocket() { // Start a WebSocket server
@@ -1038,7 +1082,7 @@ void startHomie(){
   Homie_setFirmware(ESP_NAME, ESP_FIRMWARE_VERSION);
   Homie.setLoopFunction(handleHomieLoop);
 
-  Homie.onEvent(handleHomieEvent);    // Configure Homie Event Handler
+  if(ENABLE_DEEP_SLEEP) Homie.onEvent(handleHomieEvent);    // Configure Homie Event Handler
 
 #ifdef ENABLE_DEEP_SLEEP
     deepSleeIntervalSetting.setDefaultValue(60).setValidator([] (long candidate) {
@@ -1123,6 +1167,9 @@ void setup(void){
   startOTA();                  // Start the OTA service
 #endif
   startLittleFS();             // Start the LittleFS and list all contents
+
+  printListFS();  // Print LittleFS content
+
 #ifndef NO_WEBSOCKET
   startWebSocket();            // Start a WebSocket server
 #endif
@@ -1138,7 +1185,13 @@ void setup(void){
 #endif
   readThermostatValue(); // Should be done AFTER startLittleFS
 
-  delay(1000);
+  // Laissons le temps de démarrer
+  delay(500);optimistic_yield(1000);
+  delay(500);optimistic_yield(1000);
+  delay(500);optimistic_yield(1000);
+  delay(500);optimistic_yield(1000);
+  delay(500);optimistic_yield(1000);
+
   Serial.println("Starting loop...");
 }
 
@@ -1164,17 +1217,22 @@ void loop(void){
       //Serial.println(""); // For newline after "."
       lastTS=millis();
 
+      if(loopCount>=bypassLoop){
 #ifdef DEBUG
-      Serial.println("   doOneLoop()...");
+        Serial.println("   doOneLoop()...");
 #endif
-      doOneLoop();
+        doOneLoop();
+      }else{
+        Serial.println("   Bypass count : " + String(loopCount));
+        loopCount++;
+      }
     }
 
 #ifdef DEBUG
       Serial.println("   [DEBUG] delay()...");
 #endif
     optimistic_yield(100);
-    delay(10);
+    delay(50);
 #ifdef DEBUG
       Serial.println("   [DEBUG] End of loop.");
 #endif

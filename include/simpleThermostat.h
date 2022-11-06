@@ -36,5 +36,7 @@
 #define ENABLE_DEEP_SLEEP false
 #endif
 
+#define CLOSE_LITTLEFS_EACH_TIME false  // Pour fermer LittleFS a CHAQUE utilisation
+
 #define ESP_FIRMWARE_VERSION "0.8.0"
 #define ESP_NAME "THERMOSTAT_DATA_LOGGER"
